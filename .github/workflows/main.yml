@@ -6,10 +6,10 @@ name: Main workflow
 on:
   pull_request:
     branches:
-      - main
+      - iosmcnmaster
   push:
     branches:
-      - main
+      - iosmcnmaster
 
 jobs:
   lint:
