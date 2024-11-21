@@ -545,7 +545,7 @@ func compareSubscriber(subscriberNew *Subscriber, subscriberOld *Subscriber) boo
 	return false
 }
 
-func compareGroup(groupNew *DevGroup, groupOld *DevGroup) bool {
+/* func compareGroup(groupNew *DevGroup, groupOld *DevGroup) bool {
 	if groupNew.IpDomainName != groupOld.IpDomainName {
 		logger.SimappLog.Infoln("ip domain name changed")
 		return true
@@ -603,6 +603,97 @@ func compareGroup(groupNew *DevGroup, groupOld *DevGroup) bool {
 				(oldipdomain.UeDnnQos.TrafficClass.Pdb != newipdomain.UeDnnQos.TrafficClass.Pdb) ||
 				(oldipdomain.UeDnnQos.TrafficClass.Pelr != newipdomain.UeDnnQos.TrafficClass.Pelr) {
 				return true
+			}
+		}
+	}
+
+	return false
+} */
+
+func compareGroup(groupNew *DevGroup, groupOld *DevGroup) bool {
+	// Compare IpDomainName
+	if groupNew.IpDomainName != groupOld.IpDomainName {
+		logger.SimappLog.Infoln("ip domain name changed")
+		return true
+	}
+
+	// Compare SiteInfo
+	if groupNew.SiteInfo != groupOld.SiteInfo {
+		logger.SimappLog.Infoln("siteInfo name changed")
+		return true
+	}
+
+	// Compare IMSI list length
+	if len(groupNew.Imsis) != len(groupOld.Imsis) {
+		logger.SimappLog.Infoln("number of Imsis changed")
+		return true
+	}
+
+	// Compare IMSIs using hash for efficient comparison
+	allimsiNew := ""
+	for _, imsi := range groupNew.Imsis {
+		allimsiNew = allimsiNew + imsi
+	}
+	h1 := sha1.New()
+	h1.Write([]byte(allimsiNew))
+	bs1 := h1.Sum(nil)
+	strcode1 := hex.EncodeToString(bs1[:])
+
+	allimsiOld := ""
+	for _, imsi := range groupOld.Imsis {
+		allimsiOld = allimsiOld + imsi
+	}
+	h2 := sha1.New()
+	h2.Write([]byte(allimsiOld))
+	bs2 := h2.Sum(nil)
+	strcode2 := hex.EncodeToString(bs2[:])
+
+	logger.SimappLog.Infof("CODE1: %s and CODE2: %s", strcode1, strcode2)
+	if strcode2 != strcode1 {
+		return true
+	}
+
+	// Compare IpDomains
+	if len(groupNew.IpDomains) != len(groupOld.IpDomains) {
+		logger.SimappLog.Infoln("number of IpDomains changed")
+		return true
+	}
+
+	for i := range groupNew.IpDomains {
+		if i >= len(groupOld.IpDomains) {
+			// If groupOld doesn't have enough IpDomains
+			return true
+		}
+
+		oldIpDomain := groupOld.IpDomains[i]
+		newIpDomain := groupNew.IpDomains[i]
+
+		if oldIpDomain.Dnn != newIpDomain.Dnn {
+			logger.SimappLog.Infoln("DNN changed")
+			return true
+		}
+
+		if oldIpDomain.Mtu != newIpDomain.Mtu {
+			logger.SimappLog.Infoln("MTU changed")
+			return true
+		}
+
+		if oldIpDomain.UePool != newIpDomain.UePool {
+			logger.SimappLog.Infoln("UePool changed")
+			return true
+		}
+
+		// Compare UeDnnQos if not nil
+		if oldIpDomain.UeDnnQos != nil && newIpDomain.UeDnnQos != nil {
+			if oldIpDomain.UeDnnQos.TrafficClass != nil && newIpDomain.UeDnnQos.TrafficClass != nil {
+				if oldIpDomain.UeDnnQos.TrafficClass.Name != newIpDomain.UeDnnQos.TrafficClass.Name ||
+					oldIpDomain.UeDnnQos.TrafficClass.Qci != newIpDomain.UeDnnQos.TrafficClass.Qci ||
+					oldIpDomain.UeDnnQos.TrafficClass.Arp != newIpDomain.UeDnnQos.TrafficClass.Arp ||
+					oldIpDomain.UeDnnQos.TrafficClass.Pdb != newIpDomain.UeDnnQos.TrafficClass.Pdb ||
+					oldIpDomain.UeDnnQos.TrafficClass.Pelr != newIpDomain.UeDnnQos.TrafficClass.Pelr {
+					logger.SimappLog.Infoln("TrafficClass or its properties changed")
+					return true
+				}
 			}
 		}
 	}
@@ -941,7 +1032,7 @@ func dispatchAllSubscribers(configMsgChan chan configMessage) {
 	}
 }
 
-func dispatchGroup(configMsgChan chan configMessage, group *DevGroup, msgOp int) {
+/* func dispatchGroup(configMsgChan chan configMessage, group *DevGroup, msgOp int) {
 	logger.SimappLog.Infoln("group name", group.Name)
 	logger.SimappLog.Infoln("  site name", group.SiteInfo)
 	logger.SimappLog.Infoln("  imsis", group.Imsis)
@@ -949,8 +1040,8 @@ func dispatchGroup(configMsgChan chan configMessage, group *DevGroup, msgOp int)
 		logger.SimappLog.Debugln("  IMSI", group.Imsis[im])
 	}
 	logger.SimappLog.Infoln("  IpDomainName", group.IpDomainName)
-	ipDomain := group.IpDomain
-	if group.IpDomain != nil {
+	ipDomain := group.IpDomains
+	if group.IpDomains != nil {
 		logger.SimappLog.Infoln("  IpDomain Dnn", ipDomain.Dnn)
 		logger.SimappLog.Infoln("  IpDomain Dns Primary", ipDomain.DnsPrimary)
 		logger.SimappLog.Infoln("  IpDomain Mtu", ipDomain.Mtu)
@@ -972,6 +1063,69 @@ func dispatchGroup(configMsgChan chan configMessage, group *DevGroup, msgOp int)
 	msg.name = group.Name
 	msg.msgOp = msgOp
 	configMsgChan <- msg
+}
+*/
+
+func dispatchGroup(configMsgChan chan configMessage, group *DevGroup, msgOp int) {
+	// Log basic group information
+	logger.SimappLog.Infoln("group name:", group.Name)
+	logger.SimappLog.Infoln("  site name:", group.SiteInfo)
+	logger.SimappLog.Infoln("  imsis:", group.Imsis)
+
+	for im := 0; im < len(group.Imsis); im++ {
+		logger.SimappLog.Debugln("  IMSI:", group.Imsis[im])
+	}
+
+	logger.SimappLog.Infoln("  IpDomainName:", group.IpDomainName)
+
+	// Check if IpDomains is nil or not
+	if group.IpDomains != nil {
+		for _, ipDomain := range group.IpDomains {
+			logger.SimappLog.Infoln("  IpDomain Dnn:", ipDomain.Dnn)
+			logger.SimappLog.Infoln("  IpDomain Dns Primary:", ipDomain.DnsPrimary)
+			logger.SimappLog.Infoln("  IpDomain Mtu:", ipDomain.Mtu)
+			logger.SimappLog.Infoln("  IpDomain UePool:", ipDomain.UePool)
+
+			// Check for UeDnnQos field if it's populated
+			if ipDomain.UeDnnQos != nil {
+				logger.SimappLog.Infoln("  UeDnnQos:", ipDomain.UeDnnQos)
+			} else {
+				logger.SimappLog.Warnln("  UeDnnQos is nil")
+			}
+		}
+	} else {
+		logger.SimappLog.Warnln("  IpDomains is nil")
+	}
+
+	// Marshal the group to JSON
+	b, err := json.Marshal(group)
+	if err != nil {
+		logger.SimappLog.Errorf("Error marshalling group: %v", err)
+		return
+	}
+
+	reqMsgBody := bytes.NewBuffer(b)
+
+	// Configuration validation
+	if !SimappConfig.Configuration.ConfigSlice {
+		logger.SimappLog.Warnln("Do not configure network slice")
+		return
+	}
+
+	// Prepare message for the channel
+	var msg configMessage
+	msg.msgPtr = reqMsgBody
+	msg.msgType = device_group
+	msg.name = group.Name
+	msg.msgOp = msgOp
+
+	// Send the message to the channel safely
+	select {
+	case configMsgChan <- msg:
+		logger.SimappLog.Infoln("Message sent to configMsgChan successfully")
+	default:
+		logger.SimappLog.Errorln("Failed to send message to configMsgChan: channel full or closed")
+	}
 }
 
 func dispatchAllGroups(configMsgChan chan configMessage) {
