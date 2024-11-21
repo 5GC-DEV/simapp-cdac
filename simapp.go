@@ -60,12 +60,32 @@ type Configuration struct {
 	SubProxyEndpt     *SubProxyEndpt     `yaml:"sub-proxy-endpt,omitempty"`
 }
 
-type DevGroup struct {
+/* type DevGroup struct {
 	Name         string    `yaml:"name,omitempty"`
 	SiteInfo     string    `yaml:"site-info,omitempty" json:"site-info,omitempty"`
 	Imsis        []string  `yaml:"imsis,omitempty" json:"imsis,omitempty"`
 	IpDomainName string    `yaml:"ip-domain-name,omitempty" json:"ip-domain-name,omitempty"`
 	IpDomain     *IpDomain `yaml:"ip-domain-expanded,omitempty" json:"ip-domain-expanded,omitempty"`
+	visited      bool
+}
+
+type IpDomain struct {
+	Dnn          string        `yaml:"dnn,omitempty" json:"dnn,omitempty"`
+	DnsPrimary   string        `yaml:"dns-primary,omitempty" json:"dns-primary,omitempty"`
+	DnsSecondary string        `yaml:"dns-secondary,omitempty" json:"dns-secondary,omitempty"`
+	Mtu          int           `yaml:"mtu,omitempty" json:"mtu,omitempty"`
+	UePool       string        `yaml:"ue-ip-pool,omitempty" json:"ue-ip-pool,omitempty"`
+	UeDnnQos     *UeDnnQosInfo `yaml:"ue-dnn-qos,omitempty" json:"ue-dnn-qos,omitempty"`
+} */
+
+// C-DAC
+
+type DevGroup struct {
+	Name         string     `yaml:"name,omitempty"`
+	SiteInfo     string     `yaml:"site-info,omitempty" json:"site-info,omitempty"`
+	Imsis        []string   `yaml:"imsis,omitempty" json:"imsis,omitempty"`
+	IpDomainName string     `yaml:"ip-domain-name,omitempty" json:"ip-domain-name,omitempty"`
+	IpDomains    []IpDomain `yaml:"ip-domains,omitempty" json:"ip-domains,omitempty"` // Slice for multiple DNNs
 	visited      bool
 }
 
