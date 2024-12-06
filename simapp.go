@@ -370,7 +370,10 @@ func getNextBackoffInterval(retry, interval uint) uint {
 func sendHttpReqMsg(req *http.Request) (*http.Response, error) {
 	// Keep sending request to Http server until response is success
 	var retries uint = 0
+	// logger.SimappLog.Infof("### Request body %v", req.Body)
 	body, err := io.ReadAll(req.Body)
+	// logger.SimappLog.Infof("********Request body %v", body)
+	logger.SimappLog.Infof("### Request body: %s", string(body))
 	if err != nil {
 		logger.SimappLog.Errorln(err)
 	}
@@ -464,6 +467,7 @@ func sendMessage(msgChan chan configMessage, subProvisionEndpt SubProvisionEndpt
 				if subProxyEndpt.Port != "" {
 					req.Header.Add("Dest-Url", destUrl)
 				}
+				logger.SimappLog.Infof("Message to be sent: %s", msg.String())
 				rsp, httpErr = sendHttpReqMsg(req)
 				if httpErr != nil {
 					logger.SimappLog.Errorf("post message [%v] returned error [%v]", httpend, httpErr.Error())
