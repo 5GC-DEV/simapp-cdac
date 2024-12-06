@@ -1128,11 +1128,44 @@ func dispatchGroup(configMsgChan chan configMessage, group *DevGroup, msgOp int)
 	}
 }
 
+/*
 func dispatchAllGroups(configMsgChan chan configMessage) {
 	logger.SimappLog.Infoln("number of device groups", len(SimappConfig.Configuration.DevGroup))
 	for _, group := range SimappConfig.Configuration.DevGroup {
 		dispatchGroup(configMsgChan, group, add_op)
 	}
+}
+*/
+
+func dispatchAllGroups(configMsgChan chan configMessage) {
+	// Log the total number of device groups
+	logger.SimappLog.Infoln("Starting dispatchAllGroups")
+	logger.SimappLog.Infof("Number of device groups: %d", len(SimappConfig.Configuration.DevGroup))
+
+	// Check if the device groups slice is empty
+	if len(SimappConfig.Configuration.DevGroup) == 0 {
+		logger.SimappLog.Warnln("Device groups list is empty. Nothing to dispatch.")
+		return
+	}
+
+	// Iterate over each device group
+	for idx, group := range SimappConfig.Configuration.DevGroup {
+		// Log the current group index and details
+		logger.SimappLog.Infof("Dispatching group %d: %+v", idx, group)
+
+		// Check for nil or unexpected empty fields in the group
+		if group == nil {
+			logger.SimappLog.Warnf("Group at index %d is nil. Skipping dispatch.", idx)
+			continue
+		}
+
+		// Dispatch the group
+		logger.SimappLog.Infof("Dispatching group %d with operation: %s", idx, add_op)
+		dispatchGroup(configMsgChan, group, add_op)
+	}
+
+	// Log completion of the dispatch process
+	logger.SimappLog.Infoln("Completed dispatchAllGroups")
 }
 
 func dispatchNetworkSlice(configMsgChan chan configMessage, slice *NetworkSlice, msgOp int) {
