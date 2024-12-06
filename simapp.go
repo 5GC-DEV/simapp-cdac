@@ -1099,6 +1099,7 @@ func dispatchGroup(configMsgChan chan configMessage, group *DevGroup, msgOp int)
 
 	// Marshal the group to JSON
 	b, err := json.Marshal(group)
+	logger.SimappLog.Infof("Prepared configMessage: %s", string(b))
 	if err != nil {
 		logger.SimappLog.Errorf("Error marshalling group: %v", err)
 		return
