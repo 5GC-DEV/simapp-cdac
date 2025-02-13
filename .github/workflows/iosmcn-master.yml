@@ -19,7 +19,7 @@ jobs:
 
       - uses: WillAbides/setup-go-faster@v1.14.0
         with:
-          go-version-file: 'go.mod'
+          go-version-file: "go.mod"
 
       - uses: dominikh/staticcheck-action@v1.3.1
         with:
@@ -33,10 +33,10 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: 'go.mod'
+          go-version-file: "go.mod"
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6.1.0
+        uses: golangci/golangci-lint-action@v6.1.1
         with:
           version: latest
           args: -v --config ./.golangci.yml
@@ -86,7 +86,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: 'go.mod'
+          go-version-file: "go.mod"
 
       - name: Unit tests
         run: go test ./...
@@ -94,18 +94,18 @@ jobs:
     runs-on: ubuntu-latest
     if: github.repository_owner == 'ios-mcn-core'
     needs: unit-tests
-    
+
     env:
       REGISTRY: ghcr.io
       DOCKER_REGISTRY: ghcr.io/
       DOCKER_REPOSITORY: ios-mcn-core/
-      
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: 'go.mod'
+          go-version-file: "go.mod"
 
       - run: echo GIT_SHA_SHORT=$(git rev-parse --short HEAD) >> $GITHUB_ENV
 
@@ -128,4 +128,3 @@ jobs:
         run: |
           make docker-build
           make docker-push
-
