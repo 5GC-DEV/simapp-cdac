@@ -1027,14 +1027,16 @@ func dispatchGroup(configMsgChan chan configMessage, group *DevGroup, msgOp int)
 	msg.msgType = device_group
 	msg.name = group.Name
 	msg.msgOp = msgOp
+	configMsgChan <- msg
 
 	// Send the message to the channel safely
-	select {
+	/* select {
 	case configMsgChan <- msg:
 		logger.SimappLog.Infoln("Message sent to configMsgChan successfully")
 	default:
 		logger.SimappLog.Errorln("Failed to send message to configMsgChan: channel full or closed")
-	}
+		time.Sleep(1 * time.Second)
+	}*/
 }
 
 func dispatchAllGroups(configMsgChan chan configMessage) {
