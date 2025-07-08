@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-FROM golang:1.23.2-bookworm AS builder
+FROM golang:1.24.4-bookworm AS builder
 
 RUN apt-get update && \
     apt-get -y install --no-install-recommends \
@@ -15,7 +15,7 @@ WORKDIR $GOPATH/src/simapp
 COPY . .
 RUN make all
 
-FROM alpine:3.20 AS simapp
+FROM alpine:3.22 AS simapp
 
 LABEL maintainer="Aether SD-Core <dev@lists.aetherproject.org>" \
     description="Aether open source 5G Core Network" \

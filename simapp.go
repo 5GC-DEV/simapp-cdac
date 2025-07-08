@@ -26,7 +26,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/omec-project/simapp/logger"
 	"github.com/spf13/viper"
-	"github.com/urfave/cli/v2"
+	"github.com/urfave/cli/v3"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/net/http2"
@@ -54,12 +54,12 @@ type Info struct {
 }
 
 type Configuration struct {
-	ConfigSlice       bool               `yaml:"provision-network-slice,omitempty"`
-	DevGroup          []*DevGroup        `yaml:"device-groups,omitempty"`
-	NetworkSlice      []*NetworkSlice    `yaml:"network-slices,omitempty"`
-	Subscriber        []*Subscriber      `yaml:"subscribers,omitempty"`
-	SubProvisionEndpt *SubProvisionEndpt `yaml:"sub-provision-endpt,omitempty"`
-	SubProxyEndpt     *SubProxyEndpt     `yaml:"sub-proxy-endpt,omitempty"`
+	ConfigSliceDevGroup bool               `yaml:"provision-network-slice,omitempty"`
+	DevGroup            []*DevGroup        `yaml:"device-groups,omitempty"`
+	NetworkSlice        []*NetworkSlice    `yaml:"network-slices,omitempty"`
+	Subscriber          []*Subscriber      `yaml:"subscribers,omitempty"`
+	SubProvisionEndpt   *SubProvisionEndpt `yaml:"sub-provision-endpt,omitempty"`
+	SubProxyEndpt       *SubProxyEndpt     `yaml:"sub-proxy-endpt,omitempty"`
 }
 
 type DevGroup struct {
@@ -309,7 +309,7 @@ func syncConfig(w http.ResponseWriter, req *http.Request) {
 }
 
 func main() {
-	app := cli.NewApp()
+	app := &cli.Command{}
 	app.Name = "simapp"
 	logger.SimappLog.Infoln(app.Name)
 	app.Usage = "SIMApp"
@@ -322,12 +322,12 @@ func main() {
 		},
 	}
 	app.Action = action
-	if err := app.Run(os.Args); err != nil {
+	if err := app.Run(context.Background(), os.Args); err != nil {
 		logger.SimappLog.Fatalf("SIMApp run error: %v", err)
 	}
 }
 
-func action(c *cli.Context) error {
+func action(ctx context.Context, c *cli.Command) error {
 	logger.SimappLog.Infoln("SIMApp started")
 	configMsgChan = make(chan configMessage, 100)
 	var subProvisionEndpt SubProvisionEndpt
@@ -388,6 +388,16 @@ func sendHttpReqMsg(req *http.Request) (*http.Response, error) {
 		rsp, err := client.Do(cloneReq)
 		retries += 1
 		if err != nil {
+			if rsp != nil {
+				if rsp.StatusCode == http.StatusConflict {
+					logger.SimappLog.Infof("http response StatusConflict, skipping retry")
+					err = req.Body.Close()
+					if err != nil {
+						logger.SimappLog.Errorln(err)
+					}
+					return rsp, nil
+				}
+			}
 			nextInterval := getNextBackoffInterval(retries, 2)
 			logger.SimappLog.Errorf("http req send error [%v], retrying after %d sec", err, nextInterval)
 			time.Sleep(time.Second * time.Duration(nextInterval))
@@ -404,6 +414,14 @@ func sendHttpReqMsg(req *http.Request) (*http.Response, error) {
 			}
 			return rsp, nil
 		} else {
+			if rsp.StatusCode == http.StatusConflict {
+				logger.SimappLog.Infof("http response StatusConflict, skipping retry")
+				err = req.Body.Close()
+				if err != nil {
+					logger.SimappLog.Errorln(err)
+				}
+				return rsp, nil
+			}
 			nextInterval := getNextBackoffInterval(retries, 2)
 			logger.SimappLog.Infof("http rsp error [%v], retrying after %d sec", http.StatusText(rsp.StatusCode), nextInterval)
 			err = rsp.Body.Close()
@@ -975,11 +993,13 @@ func dispatchAllSubscribers(configMsgChan chan configMessage) {
 }
 
 func dispatchGroup(configMsgChan chan configMessage, group *DevGroup, msgOp int) {
-	// Log basic group information
-	logger.SimappLog.Infoln("group name:", group.Name)
-	logger.SimappLog.Infoln("  site name:", group.SiteInfo)
-	logger.SimappLog.Infoln("  imsis:", group.Imsis)
-
+	if !SimappConfig.Configuration.ConfigSliceDevGroup {
+		logger.SimappLog.Warnln("do not configure device group")
+		return
+	}
+	logger.SimappLog.Infoln("group name", group.Name)
+	logger.SimappLog.Infoln("site name", group.SiteInfo)
+	logger.SimappLog.Infoln("imsis", group.Imsis)
 	for im := 0; im < len(group.Imsis); im++ {
 		logger.SimappLog.Debugln("  IMSI:", group.Imsis[im])
 	}
@@ -1014,14 +1034,6 @@ func dispatchGroup(configMsgChan chan configMessage, group *DevGroup, msgOp int)
 	}
 
 	reqMsgBody := bytes.NewBuffer(b)
-
-	// Configuration validation
-	if !SimappConfig.Configuration.ConfigSlice {
-		logger.SimappLog.Warnln("Do not configure network slice")
-		return
-	}
-
-	// Prepare message for the channel
 	var msg configMessage
 	msg.msgPtr = reqMsgBody
 	msg.msgType = device_group
@@ -1071,6 +1083,10 @@ func dispatchAllGroups(configMsgChan chan configMessage) {
 }
 
 func dispatchNetworkSlice(configMsgChan chan configMessage, slice *NetworkSlice, msgOp int) {
+	if !SimappConfig.Configuration.ConfigSliceDevGroup {
+		logger.SimappLog.Warnln("do not configure network slice")
+		return
+	}
 	logger.SimappLog.Infoln("slice Name:", slice.Name)
 	logger.SimappLog.Infof("slice sst %v, sd %v", slice.SliceId.Sst, slice.SliceId.Sd)
 	logger.SimappLog.Infoln("slice site info", slice.SiteInfo)
@@ -1095,10 +1111,6 @@ func dispatchNetworkSlice(configMsgChan chan configMessage, slice *NetworkSlice,
 	}
 	reqMsgBody := bytes.NewBuffer(b)
 
-	if !SimappConfig.Configuration.ConfigSlice {
-		logger.SimappLog.Warnln("do not configure network slice")
-		return
-	}
 	var msg configMessage
 	msg.msgPtr = reqMsgBody
 	msg.msgType = network_slice
