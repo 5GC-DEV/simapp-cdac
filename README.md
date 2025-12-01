@@ -3,6 +3,7 @@ Copyright 2021-present Open Networking Foundation
 SPDX-License-Identifier: Apache-2.0
 -->
 [![Go Report Card](https://goreportcard.com/badge/github.com/omec-project/simapp)](https://goreportcard.com/report/github.com/omec-project/simapp)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/omec-project/simapp/badge)](https://scorecard.dev/viewer/?uri=github.com/omec-project/simapp)
 
 # Simapp
 ## Sim subscription app for Aether
@@ -22,7 +23,7 @@ slices as well
 - In case ROC is running in the deployment then network slices can be configured
 from ROC
 
-## Reach out to us thorugh
+## Reach out to us through
 1. #sdcore-dev channel in [ONF Community Slack](https://onf-community.slack.com/)
 2. Extensive SD-Core documentation can be found at [SD-Core Documentation](https://docs.sd-core.opennetworking.org/main/index.html)
 3. Raise Github issues
