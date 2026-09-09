@@ -1,32 +1,41 @@
-# Copyright 2019-present Open Networking Foundation
 # Copyright 2024-present Intel Corporation
+# Copyright 2019-present Open Networking Foundation
 #
 # SPDX-License-Identifier: Apache-2.0
 #
 
-FROM golang:1.24.4-bookworm AS builder
-
-RUN apt-get update && \
-    apt-get -y install --no-install-recommends \
-    vim && \
-    apt-get clean
+FROM golang:1.26.5-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651 AS builder
 
 WORKDIR $GOPATH/src/simapp
 COPY . .
+ARG MAKEFLAGS
 RUN make all
 
-FROM alpine:3.22 AS simapp
+FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS simapp
 
-LABEL maintainer="Aether SD-Core <dev@lists.aetherproject.org>" \
-    description="Aether open source 5G Core Network" \
-    version="Stage 3"
+# Build arguments for dynamic labels
+ARG VERSION=dev
+ARG VCS_URL=unknown
+ARG VCS_REF=unknown
+ARG BUILD_DATE=unknown
+
+LABEL org.opencontainers.image.source="${VCS_URL}" \
+    org.opencontainers.image.version="${VERSION}" \
+    org.opencontainers.image.created="${BUILD_DATE}" \
+    org.opencontainers.image.revision="${VCS_REF}" \
+    org.opencontainers.image.url="${VCS_URL}" \
+    org.opencontainers.image.title="simapp" \
+    org.opencontainers.image.description="Aether 5G Core SIMAPP Network Function" \
+    org.opencontainers.image.authors="Aether SD-Core <dev@lists.aetherproject.org>" \
+    org.opencontainers.image.vendor="Aether Project" \
+    org.opencontainers.image.licenses="Apache-2.0" \
+    org.opencontainers.image.documentation="https://docs.sd-core.aetherproject.org/"
 
 ARG DEBUG_TOOLS
 
-# Install debug tools ~ 50MB (if DEBUG_TOOLS is set to true)
 RUN if [ "$DEBUG_TOOLS" = "true" ]; then \
-        apk update && apk add --no-cache -U gcompat vim strace net-tools curl netcat-openbsd bind-tools bash; \
-        fi
+        apk add --no-cache gcompat vim nano strace net-tools curl netcat-openbsd bind-tools bash; \
+    fi
 
 # Copy executable
 COPY --from=builder /go/src/simapp/bin/* /usr/local/bin/.
