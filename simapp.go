@@ -19,8 +19,10 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -29,8 +31,8 @@ import (
 	"github.com/urfave/cli/v3"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"go.yaml.in/yaml/v4"
 	"golang.org/x/net/http2"
-	"gopkg.in/yaml.v2"
 )
 
 type Config struct {
@@ -55,6 +57,7 @@ type Info struct {
 
 type Configuration struct {
 	ConfigSliceDevGroup bool               `yaml:"provision-network-slice,omitempty"`
+	MaxWorkers          int                `yaml:"max-workers,omitempty"`
 	DevGroup            []*DevGroup        `yaml:"device-groups,omitempty"`
 	NetworkSlice        []*NetworkSlice    `yaml:"network-slices,omitempty"`
 	Subscriber          []*Subscriber      `yaml:"subscribers,omitempty"`
@@ -68,13 +71,14 @@ type DevGroup struct {
 	Imsis        []string   `yaml:"imsis,omitempty" json:"imsis,omitempty"`
 	Msisdns      []string   `yaml:"msisdns,omitempty" json:"msisdns,omitempty"`
 	IpDomainName string     `yaml:"ip-domain-name,omitempty" json:"ip-domain-name,omitempty"`
-	IpDomains    []IpDomain `yaml:"ip-domains,omitempty" json:"ip-domains,omitempty"` // Slice for multiple DNNs
+	IpDomains    []IpDomain `yaml:"ip-domains,omitempty" json:"ip-domains,omitempty"`
 	visited      bool
 }
 
 type IpDomain struct {
 	Dnn          string        `yaml:"dnn,omitempty" json:"dnn,omitempty"`
 	DnsPrimary   string        `yaml:"dns-primary,omitempty" json:"dns-primary,omitempty"`
+	PcscfPrimary string        `yaml:"pcscf-primary,omitempty" json:"pcscf-primary,omitempty"`
 	DnsSecondary string        `yaml:"dns-secondary,omitempty" json:"dns-secondary,omitempty"`
 	Mtu          int           `yaml:"mtu,omitempty" json:"mtu,omitempty"`
 	UePool       string        `yaml:"ue-ip-pool,omitempty" json:"ue-ip-pool,omitempty"`
@@ -200,6 +204,7 @@ type configMessage struct {
 	msgType int
 	name    string
 	msgOp   int
+	wg      *sync.WaitGroup
 }
 
 func (msg configMessage) String() string {
@@ -269,15 +274,24 @@ func InitConfigFactory(f string, configMsgChan chan configMessage, subProvisionE
 		client = &http.Client{
 			Transport: &http2.Transport{
 				AllowHTTP: true,
-				DialTLS: func(network, addr string, _ *tls.Config) (net.Conn, error) {
-					return net.Dial(network, addr)
+				DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+					return (&net.Dialer{}).DialContext(ctx, network, addr)
 				},
+				StrictMaxConcurrentStreams: false,
 			},
-			Timeout: 5 * time.Second,
+			Timeout: 30 * time.Second,
 		}
 	} else {
+		transport := &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 100,
+			MaxConnsPerHost:     0,
+			IdleConnTimeout:     90 * time.Second,
+			DisableKeepAlives:   false,
+		}
 		client = &http.Client{
-			Timeout: 5 * time.Second,
+			Transport: transport,
+			Timeout:   30 * time.Second,
 		}
 	}
 
@@ -305,8 +319,8 @@ func syncConfig(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		logger.SimappLog.Errorln(err)
 	}
-	dispatchAllGroups(configMsgChan)
-	dispatchAllNetworkSlices(configMsgChan)
+	dispatchAllGroups(configMsgChan, nil)
+	dispatchAllNetworkSlices(configMsgChan, nil)
 }
 
 func main() {
@@ -349,9 +363,35 @@ func action(ctx context.Context, c *cli.Command) error {
 	go sendMessage(configMsgChan, subProvisionEndpt, subProxyEndpt)
 	go WatchConfig()
 
-	dispatchAllSubscribers(configMsgChan)
-	dispatchAllGroups(configMsgChan)
-	dispatchAllNetworkSlices(configMsgChan)
+	// Wait for webui to be ready before dispatching any messages.
+	waitForWebui(subProvisionEndpt, subProxyEndpt)
+
+	// Provisioning must follow a strict order because the webconsole's sync logic
+	// (triggered on device-group/network-slice creation) checks whether subscriber
+	// auth data already exists in the DB. If subscribers aren't committed yet,
+	// policy data is never written and UEs get REGISTRATION-REJECT.
+	//
+	// Phase 1: Subscribers (auth data must exist first)
+	// Phase 2: Device groups (reference subscriber IMSIs)
+	// Phase 3: Network slices (reference device groups; creation triggers final sync)
+
+	// Phase 1: Subscribers
+	var subscriberWg sync.WaitGroup
+	dispatchAllSubscribers(configMsgChan, &subscriberWg)
+	subscriberWg.Wait()
+	logger.SimappLog.Infoln("phase 1 complete: subscribers provisioned")
+
+	// Phase 2: Device groups
+	var groupWg sync.WaitGroup
+	dispatchAllGroups(configMsgChan, &groupWg)
+	groupWg.Wait()
+	logger.SimappLog.Infoln("phase 2 complete: device groups provisioned")
+
+	// Phase 3: Network slices
+	var sliceWg sync.WaitGroup
+	dispatchAllNetworkSlices(configMsgChan, &sliceWg)
+	sliceWg.Wait()
+	logger.SimappLog.Infoln("phase 3 complete: network slices provisioned")
 
 	http.HandleFunc("/synchronize", syncConfig)
 	err = http.ListenAndServe(":8080", nil)
@@ -423,14 +463,57 @@ func sendHttpReqMsg(req *http.Request) (*http.Response, error) {
 				}
 				return rsp, nil
 			}
+			// 4xx client errors indicate a bad request that retrying won't fix
+			if rsp.StatusCode >= 400 && rsp.StatusCode < 500 {
+				logger.SimappLog.Errorf("http rsp client error [%s], not retrying", http.StatusText(rsp.StatusCode))
+				err = req.Body.Close()
+				if err != nil {
+					logger.SimappLog.Errorln(err)
+				}
+				return rsp, fmt.Errorf("client error %d: %s", rsp.StatusCode, http.StatusText(rsp.StatusCode))
+			}
 			nextInterval := getNextBackoffInterval(retries, 2)
-			logger.SimappLog.Infof("http rsp error [%v], retrying after %d sec", http.StatusText(rsp.StatusCode), nextInterval)
+			logger.SimappLog.Infof("http rsp error [%s], retrying after %d sec", http.StatusText(rsp.StatusCode), nextInterval)
 			err = rsp.Body.Close()
 			if err != nil {
 				logger.SimappLog.Infoln(err)
 			}
 			time.Sleep(time.Second * time.Duration(nextInterval))
 		}
+	}
+}
+
+func waitForWebui(subProvisionEndpt SubProvisionEndpt, subProxyEndpt SubProxyEndpt) {
+	ip := strings.TrimSpace(subProvisionEndpt.Addr)
+	readinessURL := httpProtocol + ip + ":" + subProvisionEndpt.Port + "/config/v1/device-group/"
+	if subProxyEndpt.Port != "" {
+		proxyIP := strings.TrimSpace(subProxyEndpt.Addr)
+		readinessURL = httpProtocol + proxyIP + ":" + subProxyEndpt.Port + "/config/v1/device-group/"
+	}
+
+	logger.SimappLog.Infoln("waiting for webui to be ready at", readinessURL)
+	for {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, readinessURL, nil)
+		if err != nil {
+			logger.SimappLog.Errorf("failed to create readiness request: %v", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		rsp, err := client.Do(req)
+		if err != nil {
+			logger.SimappLog.Infof("webui not ready: %v, retrying in 2 seconds...", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		if err := rsp.Body.Close(); err != nil {
+			logger.SimappLog.Errorf("failed to close readiness response body: %v", err)
+		}
+		if rsp.StatusCode >= 200 && rsp.StatusCode < 300 {
+			logger.SimappLog.Infoln("webui is ready, starting message processing")
+			return
+		}
+		logger.SimappLog.Infof("webui returned status %d, retrying in 2 seconds...", rsp.StatusCode)
+		time.Sleep(2 * time.Second)
 	}
 }
 
@@ -447,7 +530,7 @@ func sendMessage(msgChan chan configMessage, subProvisionEndpt SubProvisionEndpt
 	devGroupHttpend = httpProtocol + ip + ":" + subProvisionEndpt.Port + "/config/v1/device-group/"
 	logger.SimappLog.Infoln("device trigger http endpoint", devGroupHttpend)
 	networkSliceHttpend = httpProtocol + ip + ":" + subProvisionEndpt.Port + "/config/v1/network-slice/"
-	logger.SimappLog.Infoln("network slice http endpoint", devGroupHttpend)
+	logger.SimappLog.Infoln("network slice http endpoint", networkSliceHttpend)
 	subscriberHttpend = httpProtocol + ip + ":" + subProvisionEndpt.Port + "/api/subscriber/imsi-"
 	logger.SimappLog.Infoln("subscriber http endpoint", subscriberHttpend)
 	baseDestUrl := subscriberHttpend
@@ -456,95 +539,120 @@ func sendMessage(msgChan chan configMessage, subProvisionEndpt SubProvisionEndpt
 		devGroupHttpend = httpProtocol + ip + ":" + subProxyEndpt.Port + "/config/v1/device-group/"
 		logger.SimappLog.Infoln("device trigger Proxy http endpoint", devGroupHttpend)
 		networkSliceHttpend = httpProtocol + ip + ":" + subProxyEndpt.Port + "/config/v1/network-slice/"
-		logger.SimappLog.Infoln("network slice Proxy http endpoint", devGroupHttpend)
+		logger.SimappLog.Infoln("network slice Proxy http endpoint", networkSliceHttpend)
 		subscriberHttpend = httpProtocol + ip + ":" + subProxyEndpt.Port + "/api/subscriber/imsi-"
 		logger.SimappLog.Infoln("subscriber Proxy http endpoint", subscriberHttpend)
 	}
 
-	for msg := range msgChan {
-		var httpend string
-		var destUrl string
-		logger.SimappLog.Debugln("received message from channel", msg)
-		switch msg.msgType {
-		case device_group:
-			httpend = devGroupHttpend + msg.name
-		case network_slice:
-			httpend = networkSliceHttpend + msg.name
-		case subscriber:
-			httpend = subscriberHttpend + msg.name
-			destUrl = baseDestUrl + msg.name
-		}
-		var rsp *http.Response
-		var httpErr error
-		for {
-			if msg.msgOp == add_op {
-				logger.SimappLog.Infof("post message [%v] to %v", msg.String(), httpend)
-				req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, httpend, msg.msgPtr)
-				if err != nil {
-					logger.SimappLog.Errorf("an error occurred %v", err)
-					time.Sleep(1 * time.Second)
-					continue
-				}
-
-				req.Header.Set("Content-Type", "application/json; charset=utf-8")
-				if subProxyEndpt.Port != "" {
-					req.Header.Add("Dest-Url", destUrl)
-				}
-				rsp, httpErr = sendHttpReqMsg(req)
-				if httpErr != nil {
-					logger.SimappLog.Errorf("post message [%v] returned error [%v]", httpend, httpErr.Error())
-				}
-
-				logger.SimappLog.Infof("message POST %v success", rsp.StatusCode)
-			} else if msg.msgOp == modify_op {
-				logger.SimappLog.Infof("put message [%v] to %v", msg.String(), httpend)
-
-				req, err := http.NewRequestWithContext(context.Background(), http.MethodPut, httpend, msg.msgPtr)
-				// Handle Error
-				if err != nil {
-					logger.SimappLog.Errorf("an error occurred %v", err)
-					time.Sleep(1 * time.Second)
-					continue
-				}
-				// set the request header Content-Type for json
-				req.Header.Set("Content-Type", "application/json; charset=utf-8")
-				if subProxyEndpt.Port != "" {
-					req.Header.Add("Dest-Url", destUrl)
-				}
-				rsp, httpErr = sendHttpReqMsg(req)
-				if httpErr != nil {
-					logger.SimappLog.Errorf("put message [%v] returned error [%v]", httpend, httpErr.Error())
-				}
-
-				logger.SimappLog.Infof("message PUT %v success", rsp.StatusCode)
-			} else if msg.msgOp == delete_op {
-				logger.SimappLog.Infof("delete message [%v] to %v", msg.String(), httpend)
-
-				req, err := http.NewRequestWithContext(context.Background(), http.MethodDelete, httpend, msg.msgPtr)
-				// Handle Error
-				if err != nil {
-					logger.SimappLog.Errorf("an error occurred %v", err)
-					time.Sleep(1 * time.Second)
-					continue
-				}
-				// set the request header Content-Type for json
-				req.Header.Set("Content-Type", "application/json; charset=utf-8")
-				if subProxyEndpt.Port != "" {
-					req.Header.Add("Dest-Url", destUrl)
-				}
-				rsp, httpErr = sendHttpReqMsg(req)
-				if httpErr != nil {
-					logger.SimappLog.Errorf("delete message [%v] returned error [%v]", httpend, httpErr.Error())
-				}
-				logger.SimappLog.Infof("message DEL %v success", rsp.StatusCode)
-			}
-			err := rsp.Body.Close()
-			if err != nil {
-				logger.SimappLog.Errorln(err)
-			}
-			break
-		}
+	// Create a worker pool with configurable max concurrent requests
+	maxWorkers := SimappConfig.Configuration.MaxWorkers
+	if maxWorkers <= 0 {
+		maxWorkers = 50
 	}
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, maxWorkers)
+
+	logger.SimappLog.Infof("starting message processor with %d parallel workers", maxWorkers)
+
+	for msg := range msgChan {
+		wg.Add(1)
+		semaphore <- struct{}{} // Acquire semaphore
+
+		go func(msg configMessage) {
+			defer wg.Done()
+			defer func() { <-semaphore }() // Release semaphore
+
+			var httpend string
+			var destUrl string
+			logger.SimappLog.Debugln("received message from channel", msg)
+			switch msg.msgType {
+			case device_group:
+				httpend = devGroupHttpend + msg.name
+			case network_slice:
+				httpend = networkSliceHttpend + msg.name
+			case subscriber:
+				httpend = subscriberHttpend + msg.name
+				destUrl = baseDestUrl + msg.name
+			}
+			var rsp *http.Response
+			var httpErr error
+			for {
+				if msg.msgOp == add_op {
+					logger.SimappLog.Infof("post message [%v] to %v", msg.String(), httpend)
+					req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, httpend, msg.msgPtr)
+					if err != nil {
+						logger.SimappLog.Errorf("an error occurred %v", err)
+						time.Sleep(1 * time.Second)
+						continue
+					}
+
+					req.Header.Set("Content-Type", "application/json; charset=utf-8")
+					if subProxyEndpt.Port != "" {
+						req.Header.Add("Dest-Url", destUrl)
+					}
+					rsp, httpErr = sendHttpReqMsg(req)
+					if httpErr != nil {
+						logger.SimappLog.Errorf("post message [%v] returned error [%v]", httpend, httpErr.Error())
+					}
+
+					logger.SimappLog.Infof("message POST %v success", rsp.StatusCode)
+				} else if msg.msgOp == modify_op {
+					logger.SimappLog.Infof("put message [%v] to %v", msg.String(), httpend)
+
+					req, err := http.NewRequestWithContext(context.Background(), http.MethodPut, httpend, msg.msgPtr)
+					// Handle Error
+					if err != nil {
+						logger.SimappLog.Errorf("an error occurred %v", err)
+						time.Sleep(1 * time.Second)
+						continue
+					}
+					// set the request header Content-Type for json
+					req.Header.Set("Content-Type", "application/json; charset=utf-8")
+					if subProxyEndpt.Port != "" {
+						req.Header.Add("Dest-Url", destUrl)
+					}
+					rsp, httpErr = sendHttpReqMsg(req)
+					if httpErr != nil {
+						logger.SimappLog.Errorf("put message [%v] returned error [%v]", httpend, httpErr.Error())
+					}
+
+					logger.SimappLog.Infof("message PUT %v success", rsp.StatusCode)
+				} else if msg.msgOp == delete_op {
+					logger.SimappLog.Infof("delete message [%v] to %v", msg.String(), httpend)
+
+					req, err := http.NewRequestWithContext(context.Background(), http.MethodDelete, httpend, msg.msgPtr)
+					// Handle Error
+					if err != nil {
+						logger.SimappLog.Errorf("an error occurred %v", err)
+						time.Sleep(1 * time.Second)
+						continue
+					}
+					// set the request header Content-Type for json
+					req.Header.Set("Content-Type", "application/json; charset=utf-8")
+					if subProxyEndpt.Port != "" {
+						req.Header.Add("Dest-Url", destUrl)
+					}
+					rsp, httpErr = sendHttpReqMsg(req)
+					if httpErr != nil {
+						logger.SimappLog.Errorf("delete message [%v] returned error [%v]", httpend, httpErr.Error())
+					}
+					logger.SimappLog.Infof("message DEL %v success", rsp.StatusCode)
+				}
+				err := rsp.Body.Close()
+				if err != nil {
+					logger.SimappLog.Errorln(err)
+				}
+				if msg.wg != nil {
+					msg.wg.Done()
+				}
+				break
+			}
+		}(msg)
+	}
+
+	// Wait for all goroutines to complete before exiting
+	wg.Wait()
+	logger.SimappLog.Infoln("all messages processed, message sender shutting down")
 }
 
 func compareSubscriber(subscriberNew *Subscriber, subscriberOld *Subscriber) bool {
@@ -590,14 +698,13 @@ func compareGroup(groupNew *DevGroup, groupOld *DevGroup) bool {
 		return true
 	}
 
-	// Compare MSISDN list length
+	// Compare MSISDN lists
 	if !reflect.DeepEqual(groupNew.Msisdns, groupOld.Msisdns) {
 		logger.SimappLog.Infoln("msisdns list has changed")
 		return true
 	}
 
-	// Compare IMSIs using hash for efficient comparison
-	allimsiNew := ""
+	var allimsiNew string
 	for _, imsi := range groupNew.Imsis {
 		allimsiNew = allimsiNew + imsi
 	}
@@ -620,9 +727,8 @@ func compareGroup(groupNew *DevGroup, groupOld *DevGroup) bool {
 		return true
 	}
 
-	// Compare IpDomains
 	if len(groupNew.IpDomains) != len(groupOld.IpDomains) {
-		logger.SimappLog.Infoln("number of IpDomains changed")
+		logger.SimappLog.Infoln("Number of IpDomains changed")
 		return true
 	}
 
@@ -645,26 +751,52 @@ func compareGroup(groupNew *DevGroup, groupOld *DevGroup) bool {
 			return true
 		}
 
+		if oldIpDomain.PcscfPrimary != newIpDomain.PcscfPrimary {
+			logger.SimappLog.Infoln("PcscfPrimary changed")
+			return true
+		}
+
 		if oldIpDomain.UePool != newIpDomain.UePool {
 			logger.SimappLog.Infoln("UePool changed")
 			return true
 		}
 
-		// Compare UeDnnQos if not nil
+		// Detect addition or removal of UeDnnQos
+		if (oldIpDomain.UeDnnQos == nil) != (newIpDomain.UeDnnQos == nil) {
+			logger.SimappLog.Infoln("UeDnnQos presence changed")
+			return true
+		}
+
 		if oldIpDomain.UeDnnQos != nil && newIpDomain.UeDnnQos != nil {
-			if oldIpDomain.UeDnnQos.TrafficClass != nil && newIpDomain.UeDnnQos.TrafficClass != nil {
+			// Detect addition or removal of TrafficClass
+			if (oldIpDomain.UeDnnQos.TrafficClass == nil) !=
+				(newIpDomain.UeDnnQos.TrafficClass == nil) {
+				logger.SimappLog.Infoln("TrafficClass presence changed")
+				return true
+			}
+
+			// Compare UeDnnQos bitrate fields
+			if oldIpDomain.UeDnnQos.Uplink != newIpDomain.UeDnnQos.Uplink ||
+				oldIpDomain.UeDnnQos.Downlink != newIpDomain.UeDnnQos.Downlink ||
+				oldIpDomain.UeDnnQos.BitRateUnit != newIpDomain.UeDnnQos.BitRateUnit {
+				logger.SimappLog.Infoln("UeDnnQos bitrate parameters changed")
+				return true
+			}
+
+			// Compare TrafficClass fields when both exist
+			if oldIpDomain.UeDnnQos.TrafficClass != nil &&
+				newIpDomain.UeDnnQos.TrafficClass != nil {
 				if oldIpDomain.UeDnnQos.TrafficClass.Name != newIpDomain.UeDnnQos.TrafficClass.Name ||
 					oldIpDomain.UeDnnQos.TrafficClass.Qci != newIpDomain.UeDnnQos.TrafficClass.Qci ||
 					oldIpDomain.UeDnnQos.TrafficClass.Arp != newIpDomain.UeDnnQos.TrafficClass.Arp ||
 					oldIpDomain.UeDnnQos.TrafficClass.Pdb != newIpDomain.UeDnnQos.TrafficClass.Pdb ||
 					oldIpDomain.UeDnnQos.TrafficClass.Pelr != newIpDomain.UeDnnQos.TrafficClass.Pelr {
-					logger.SimappLog.Infoln("TrafficClass or its properties changed")
+					logger.SimappLog.Infoln("TrafficClass properties changed")
 					return true
 				}
 			}
 		}
 	}
-
 	return false
 }
 
@@ -676,27 +808,13 @@ func compareNetworkSlice(sliceNew *NetworkSlice, sliceOld *NetworkSlice) bool {
 		return true
 	}
 	for _, ng := range sliceNew.DevGroups {
-		found := false
-		for _, og := range sliceOld.DevGroups {
-			if ng == og {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !slices.Contains(sliceOld.DevGroups, ng) {
 			logger.SimappLog.Infoln("new dev group added in slice")
 			return true // 2 network slices have some difference
 		}
 	}
 	for _, ng := range sliceOld.DevGroups {
-		found := false
-		for _, og := range sliceNew.DevGroups {
-			if ng == og {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !slices.Contains(sliceNew.DevGroups, ng) {
 			logger.SimappLog.Infoln("dev group deleted in slice")
 			return true // 2 network slices have some difference
 		}
@@ -715,14 +833,9 @@ func compareNetworkSlice(sliceNew *NetworkSlice, sliceOld *NetworkSlice) bool {
 	}
 
 	for _, newgnb := range newSite.Gnb {
-		found := false
-		for _, oldgnb := range oldSite.Gnb {
-			if newgnb.Name == oldgnb.Name && newgnb.Tac == oldgnb.Tac {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !slices.ContainsFunc(oldSite.Gnb, func(oldgnb *Gnb) bool {
+			return newgnb.Name == oldgnb.Name && newgnb.Tac == oldgnb.Tac
+		}) {
 			logger.SimappLog.Infoln("gnb changed in slice")
 			return true // change in slice details
 		}
@@ -730,6 +843,25 @@ func compareNetworkSlice(sliceNew *NetworkSlice, sliceOld *NetworkSlice) bool {
 
 	logger.SimappLog.Warnln("no change in slices")
 	return false
+}
+
+func isImsiInSubscribers(imsi int, subscribers []*Subscriber) (bool, *Subscriber) {
+	for _, subscriber := range subscribers {
+		start, err := strconv.Atoi(subscriber.UeIdStart)
+		if err != nil {
+			logger.SimappLog.Errorln("error in Atoi with UeIdStart", err)
+			continue
+		}
+		end, err := strconv.Atoi(subscriber.UeIdEnd)
+		if err != nil {
+			logger.SimappLog.Errorln("error in Atoi with UeIdEnd", err)
+			continue
+		}
+		if imsi >= start && imsi <= end {
+			return true, subscriber
+		}
+	}
+	return false, nil
 }
 
 func UpdateConfig(f string) error {
@@ -748,8 +880,7 @@ func UpdateConfig(f string) error {
 
 		logger.SimappLog.Infoln("number of subscriber ranges in updated config", len(SimappConfig.Configuration.Subscriber))
 		var newImsiList []uint64
-		for o := 0; o < len(NewSimappConfig.Configuration.Subscriber); o++ {
-			newSubscribers := NewSimappConfig.Configuration.Subscriber[o]
+		for _, newSubscribers := range NewSimappConfig.Configuration.Subscriber {
 			logger.SimappLog.Infoln("Subscribers:")
 			logger.SimappLog.Infoln("UeIdStart", newSubscribers.UeIdStart)
 			logger.SimappLog.Infoln("UeIdEnd", newSubscribers.UeIdEnd)
@@ -770,31 +901,13 @@ func UpdateConfig(f string) error {
 				continue
 			}
 			for i := newStart; i <= newEnd; i++ {
-				found := false
 				newImsiList = append(newImsiList, uint64(i))
-				for s := 0; s < len(SimappConfig.Configuration.Subscriber); s++ {
-					subscribers := SimappConfig.Configuration.Subscriber[s]
-					start, err := strconv.Atoi(subscribers.UeIdStart)
-					if err != nil {
-						logger.SimappLog.Errorln("error in Atoi with UeIdStart", err)
-						continue
-					}
-					end, err := strconv.Atoi(subscribers.UeIdEnd)
-					if err != nil {
-						logger.SimappLog.Errorln("error in Atoi with UeIdEnd", err)
-						continue
-					}
-					for j := start; j <= end; j++ {
-						if i == j { // two subcribers' imsi are same
-							found = true
-							if compareSubscriber(newSubscribers, subscribers) {
-								logger.SimappLog.Warnln("subscriber provision not support modify yet")
-							}
-							break
-						}
-					}
-				}
+
+				found, existingSubscriber := isImsiInSubscribers(i, SimappConfig.Configuration.Subscriber)
 				if found {
+					if compareSubscriber(newSubscribers, existingSubscriber) {
+						logger.SimappLog.Warnln("subscriber provision not support modify yet")
+					}
 					continue
 				}
 				// add subscriber to chan
@@ -815,8 +928,7 @@ func UpdateConfig(f string) error {
 			}
 		}
 		// delete all the existing subscribers not show up in new config.
-		for o := 0; o < len(SimappConfig.Configuration.Subscriber); o++ {
-			subscribers := SimappConfig.Configuration.Subscriber[o]
+		for _, subscribers := range SimappConfig.Configuration.Subscriber {
 			start, err := strconv.Atoi(subscribers.UeIdStart)
 			if err != nil {
 				logger.SimappLog.Errorln("error in Atoi with UeIdStart", err)
@@ -828,13 +940,7 @@ func UpdateConfig(f string) error {
 				continue
 			}
 			for k := start; k <= end; k++ {
-				has := false
-				for _, v := range newImsiList {
-					if v == uint64(k) {
-						has = true
-					}
-				}
-				if !has {
+				if !slices.Contains(newImsiList, uint64(k)) {
 					logger.SimappLog.Infoln("going to delete subscriber:", k)
 					b, err := json.Marshal("")
 					if err != nil {
@@ -865,14 +971,11 @@ func UpdateConfig(f string) error {
 					if configChange {
 						// send Group Put
 						logger.SimappLog.Infoln("updated group config", groupNew.Name)
-						dispatchGroup(configMsgChan, groupNew, modify_op)
+						dispatchGroup(configMsgChan, groupNew, modify_op, nil)
 						// find all slices which are using this device group and mark them modified
 						for _, slice := range SimappConfig.Configuration.NetworkSlice {
-							for _, dg := range slice.DevGroups {
-								if groupOld.Name == dg {
-									slice.modified = true
-									break
-								}
+							if slices.Contains(slice.DevGroups, groupOld.Name) {
+								slice.modified = true
 							}
 						}
 					} else {
@@ -886,21 +989,18 @@ func UpdateConfig(f string) error {
 			if !found {
 				// new Group - Send Post
 				logger.SimappLog.Infoln("new group config", groupNew.Name)
-				dispatchGroup(configMsgChan, groupNew, add_op)
+				dispatchGroup(configMsgChan, groupNew, add_op, nil)
 			}
 		}
 		// visit all groups see if slice is deleted...if found = false
 		for _, group := range SimappConfig.Configuration.DevGroup {
 			if !group.visited {
 				logger.SimappLog.Infoln("group deleted", group.Name)
-				dispatchGroup(configMsgChan, group, delete_op)
+				dispatchGroup(configMsgChan, group, delete_op, nil)
 				// find all slices which are using this device group and mark them modified
 				for _, slice := range SimappConfig.Configuration.NetworkSlice {
-					for _, dg := range slice.DevGroups {
-						if group.Name == dg {
-							slice.modified = true
-							break
-						}
+					if slices.Contains(slice.DevGroups, group.Name) {
+						slice.modified = true
 					}
 				}
 			}
@@ -921,11 +1021,11 @@ func UpdateConfig(f string) error {
 					if sliceOld.modified {
 						logger.SimappLog.Infoln("updated slice config", sliceNew.Name)
 						sliceOld.modified = false
-						dispatchNetworkSlice(configMsgChan, sliceNew, modify_op)
+						dispatchNetworkSlice(configMsgChan, sliceNew, modify_op, nil)
 					} else if configChange {
 						// send Slice Put
 						logger.SimappLog.Infoln("updated slice config", sliceNew.Name)
-						dispatchNetworkSlice(configMsgChan, sliceNew, modify_op)
+						dispatchNetworkSlice(configMsgChan, sliceNew, modify_op, nil)
 					} else {
 						logger.SimappLog.Infoln("config not updated for slice", sliceNew.Name)
 					}
@@ -937,14 +1037,14 @@ func UpdateConfig(f string) error {
 			if !found {
 				// new Slice - Send Post
 				logger.SimappLog.Infoln("new slice config", sliceNew.Name)
-				dispatchNetworkSlice(configMsgChan, sliceNew, add_op)
+				dispatchNetworkSlice(configMsgChan, sliceNew, add_op, nil)
 			}
 		}
 		// visit all sliceOld see if slice is deleted...if found = false
 		for _, slice := range SimappConfig.Configuration.NetworkSlice {
 			if !slice.visited {
 				logger.SimappLog.Infoln("slice deleted", slice.Name)
-				dispatchNetworkSlice(configMsgChan, slice, delete_op)
+				dispatchNetworkSlice(configMsgChan, slice, delete_op, nil)
 			}
 		}
 		SimappConfig.Configuration.NetworkSlice = NewSimappConfig.Configuration.NetworkSlice
@@ -957,7 +1057,7 @@ func WatchConfig() {
 	viper.OnConfigChange(func(e fsnotify.Event) {
 		logger.SimappLog.Infoln("config file changed:", e.Name)
 		if err := UpdateConfig("config/simapp.yaml"); err != nil {
-			logger.SimappLog.Errorln("error in loading updated configuration ", err)
+			logger.SimappLog.Errorln("error in loading updated configuration", err)
 		} else {
 			logger.SimappLog.Infoln("successfully updated configuration")
 		}
@@ -965,11 +1065,12 @@ func WatchConfig() {
 	logger.SimappLog.Infoln("watchConfig done")
 }
 
-func dispatchAllSubscribers(configMsgChan chan configMessage) {
+func dispatchAllSubscribers(configMsgChan chan configMessage, wg *sync.WaitGroup) {
 	logger.SimappLog.Infoln("number of subscriber ranges", len(SimappConfig.Configuration.Subscriber))
-	for o := 0; o < len(SimappConfig.Configuration.Subscriber); o++ {
-		subscribers := SimappConfig.Configuration.Subscriber[o]
-		logger.SimappLog.Infof("Subscribers: UeIdStart: %s, UeIdEnd: %s, PlmnId: %s, OPc: %s, OP: %s, Key: %s, SequenceNumber: %s", subscribers.UeIdStart, subscribers.UeIdEnd, subscribers.PlmnId, subscribers.OPc, subscribers.OP, subscribers.Key, subscribers.SequenceNumber)
+	for _, subscribers := range SimappConfig.Configuration.Subscriber {
+		logger.SimappLog.Infof("subscribers: UeIdStart: %s, UeIdEnd: %s, PlmnId: %s, OPc: %s, OP: %s, Key: %s, SequenceNumber: %s",
+			subscribers.UeIdStart, subscribers.UeIdEnd, subscribers.PlmnId, subscribers.OPc,
+			subscribers.OP, subscribers.Key, subscribers.SequenceNumber)
 		start, err := strconv.Atoi(subscribers.UeIdStart)
 		if err != nil {
 			logger.SimappLog.Errorln("error in Atoi with UeIdStart", err)
@@ -994,12 +1095,16 @@ func dispatchAllSubscribers(configMsgChan chan configMessage) {
 			msg.msgType = subscriber
 			msg.name = subscribers.UeId
 			msg.msgOp = add_op
+			if wg != nil {
+				wg.Add(1)
+				msg.wg = wg
+			}
 			configMsgChan <- msg
 		}
 	}
 }
 
-func dispatchGroup(configMsgChan chan configMessage, group *DevGroup, msgOp int) {
+func dispatchGroup(configMsgChan chan configMessage, group *DevGroup, msgOp int, wg *sync.WaitGroup) {
 	if !SimappConfig.Configuration.ConfigSliceDevGroup {
 		logger.SimappLog.Warnln("do not configure device group")
 		return
@@ -1007,21 +1112,20 @@ func dispatchGroup(configMsgChan chan configMessage, group *DevGroup, msgOp int)
 	logger.SimappLog.Infoln("group name", group.Name)
 	logger.SimappLog.Infoln("site name", group.SiteInfo)
 	logger.SimappLog.Infoln("imsis", group.Imsis)
-	for im := 0; im < len(group.Imsis); im++ {
-		logger.SimappLog.Debugln("  IMSI:", group.Imsis[im])
+	for _, imsi := range group.Imsis {
+		logger.SimappLog.Debugln("imsi", imsi)
 	}
-
-	logger.SimappLog.Infoln("  IpDomainName:", group.IpDomainName)
-
+	logger.SimappLog.Infoln("IpDomainName", group.IpDomainName)
 	// Check if IpDomains is nil or not
 	if group.IpDomains != nil {
 		for _, ipDomain := range group.IpDomains {
 			logger.SimappLog.Infoln("  IpDomain Dnn:", ipDomain.Dnn)
 			logger.SimappLog.Infoln("  IpDomain Dns Primary:", ipDomain.DnsPrimary)
+			logger.SimappLog.Infoln("  IpDomain Pcscf Primary:", ipDomain.PcscfPrimary)
 			logger.SimappLog.Infoln("  IpDomain Mtu:", ipDomain.Mtu)
 			logger.SimappLog.Infoln("  IpDomain UePool:", ipDomain.UePool)
 
-			// Check for UeDnnQos field if it's populated
+			// Check if UeDnnQos field is populated
 			if ipDomain.UeDnnQos != nil {
 				logger.SimappLog.Infoln("  UeDnnQos:", ipDomain.UeDnnQos)
 			} else {
@@ -1031,8 +1135,6 @@ func dispatchGroup(configMsgChan chan configMessage, group *DevGroup, msgOp int)
 	} else {
 		logger.SimappLog.Warnln("  IpDomains is nil")
 	}
-
-	// Marshal the group to JSON
 	b, err := json.Marshal(group)
 	logger.SimappLog.Infof("Prepared configMessage: %s", string(b))
 	if err != nil {
@@ -1046,6 +1148,10 @@ func dispatchGroup(configMsgChan chan configMessage, group *DevGroup, msgOp int)
 	msg.msgType = device_group
 	msg.name = group.Name
 	msg.msgOp = msgOp
+	if wg != nil {
+		wg.Add(1)
+		msg.wg = wg
+	}
 	configMsgChan <- msg
 
 	// Send the message to the channel safely
@@ -1058,57 +1164,36 @@ func dispatchGroup(configMsgChan chan configMessage, group *DevGroup, msgOp int)
 	}*/
 }
 
-func dispatchAllGroups(configMsgChan chan configMessage) {
-	// Log the total number of device groups
-	logger.SimappLog.Infoln("Starting dispatchAllGroups")
-	logger.SimappLog.Infof("Number of device groups: %d", len(SimappConfig.Configuration.DevGroup))
-
-	// Check if the device groups slice is empty
-	if len(SimappConfig.Configuration.DevGroup) == 0 {
-		logger.SimappLog.Warnln("Device groups list is empty. Nothing to dispatch.")
-		return
-	}
-
-	// Iterate over each device group
-	for idx, group := range SimappConfig.Configuration.DevGroup {
-		// Log the current group index and details
-		logger.SimappLog.Infof("Dispatching group %d: %+v", idx, group)
-
-		// Check for nil or unexpected empty fields in the group
-		if group == nil {
-			logger.SimappLog.Warnf("Group at index %d is nil. Skipping dispatch.", idx)
-			continue
-		}
-
-		// Dispatch the group
-		logger.SimappLog.Infof("Dispatching group %d with operation: %s", idx, add_op)
-		dispatchGroup(configMsgChan, group, add_op)
+func dispatchAllGroups(configMsgChan chan configMessage, wg *sync.WaitGroup) {
+	logger.SimappLog.Infoln("number of device groups", len(SimappConfig.Configuration.DevGroup))
+	for _, group := range SimappConfig.Configuration.DevGroup {
+		dispatchGroup(configMsgChan, group, add_op, wg)
 	}
 
 	// Log completion of the dispatch process
 	logger.SimappLog.Infoln("Completed dispatchAllGroups")
 }
 
-func dispatchNetworkSlice(configMsgChan chan configMessage, slice *NetworkSlice, msgOp int) {
+func dispatchNetworkSlice(configMsgChan chan configMessage, slice *NetworkSlice, msgOp int, wg *sync.WaitGroup) {
 	if !SimappConfig.Configuration.ConfigSliceDevGroup {
 		logger.SimappLog.Warnln("do not configure network slice")
 		return
 	}
-	logger.SimappLog.Infoln("slice Name:", slice.Name)
+	logger.SimappLog.Infoln("slice name:", slice.Name)
 	logger.SimappLog.Infof("slice sst %v, sd %v", slice.SliceId.Sst, slice.SliceId.Sd)
-	logger.SimappLog.Infoln("slice site info", slice.SiteInfo)
+	logger.SimappLog.Infof("slice site info: %+v", slice.SiteInfo)
 	site := slice.SiteInfo
 	logger.SimappLog.Infoln("slice site name", site.SiteName)
 	logger.SimappLog.Infoln("slice gNB", len(site.Gnb))
-	for e := 0; e < len(site.Gnb); e++ {
-		logger.SimappLog.Infof("slice gNB[%v] = %s, tac: %d", e, site.Gnb[e].Name, site.Gnb[e].Tac)
+	for i, gnb := range site.Gnb {
+		logger.SimappLog.Infof("slice gNB[%v] = %s, tac: %d", i, gnb.Name, gnb.Tac)
 	}
-	logger.SimappLog.Infoln("slice Plmn", site.Plmn)
-	logger.SimappLog.Infoln("slice Upf", site.Upf)
+	logger.SimappLog.Infof("slice Plmn %+v", site.Plmn)
+	logger.SimappLog.Infof("slice Upf %+v", site.Upf)
 
 	logger.SimappLog.Infoln("slice device groups", slice.DevGroups)
-	for im := 0; im < len(slice.DevGroups); im++ {
-		logger.SimappLog.Infoln("attached device groups", slice.DevGroups[im])
+	for _, devGroup := range slice.DevGroups {
+		logger.SimappLog.Infoln("attached device group", devGroup)
 	}
 
 	b, err := json.Marshal(slice)
@@ -1123,12 +1208,16 @@ func dispatchNetworkSlice(configMsgChan chan configMessage, slice *NetworkSlice,
 	msg.msgType = network_slice
 	msg.name = slice.Name
 	msg.msgOp = msgOp
+	if wg != nil {
+		wg.Add(1)
+		msg.wg = wg
+	}
 	configMsgChan <- msg
 }
 
-func dispatchAllNetworkSlices(configMsgChan chan configMessage) {
+func dispatchAllNetworkSlices(configMsgChan chan configMessage, wg *sync.WaitGroup) {
 	logger.SimappLog.Infoln("number of network slices", len(SimappConfig.Configuration.NetworkSlice))
 	for _, slice := range SimappConfig.Configuration.NetworkSlice {
-		dispatchNetworkSlice(configMsgChan, slice, add_op)
+		dispatchNetworkSlice(configMsgChan, slice, add_op, wg)
 	}
 }
